@@ -1,0 +1,25 @@
+{
+  "name": "local-worker",
+  "version": "1.0.0",
+  "description": "Cross-platform background worker (Windows / macOS / Linux) for ee-auto.up.railway.app",
+  "type": "module",
+  "main": "worker.mjs",
+  "scripts": {
+    "start": "node worker.mjs",
+    "scan": "node gmap.mjs",
+    "agy": "node agy.mjs",
+    "test": "node gmap.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "automation",
+    "worker",
+    "gmap",
+    "antigravity",
+    "ee-auto"
+  ],
+  "author": "Zhihong",
+  "license": "ISC"
+}
