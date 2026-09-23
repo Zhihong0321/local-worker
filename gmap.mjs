@@ -90,7 +90,7 @@ const TOWN_CATEGORIES = [
   'contractor', 'beauty salon', 'grocery store', 'cafe', 'hotel',
 ];
 
-/** Same key db.mjs dedupes on, so a merged sweep cannot land one shop twice. */
+/** Deduplicate cards found across category searches before returning them to the hub. */
 function dedupeKey(b) {
   const m = /!19s([A-Za-z0-9_-]+)/.exec(b.mapsUrl ?? '');
   return m ? m[1] : 'name:' + (b.name ?? '').toLowerCase().trim() + '|' + (b.address ?? '').toLowerCase().trim();

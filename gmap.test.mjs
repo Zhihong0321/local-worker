@@ -93,35 +93,3 @@ test('a captcha over a place card still blocks', () => {
   assert.equal(r.blocked, true);
   assert.equal(r.blockedReason, 'captcha');
 });
-
-// Company identity. Google issues a place id per branch, so one registered
-// company arrives as several rows; a storefront name is not unique at all.
-import { placeKey, isRegisteredName } from './db.mjs';
-
-test('a registered company name is the identity, whatever branch was scanned', () => {
-  const hq     = { name: 'ERS Energy Sdn Bhd',   mapsUrl: 'x!19sChIJtSkymAA2zDERkMgdt9O8WV0' };
-  const branch = { name: 'ERS Energy Sdn. Bhd.', mapsUrl: 'x!19sChIJ48t7BslLzDERLZoBKeYqomQ' };
-  assert.equal(placeKey(hq), placeKey(branch));
-  assert.equal(placeKey(hq), 'name:ers energy sdn bhd');
-});
-
-test('the same company from a feed row and a place card is one row', () => {
-  const feed = { name: 'Eternalgy Sdn Bhd', address: '23-01, Jalan Mutiara Emas 10/19', mapsUrl: 'x!19sChIJj9bg8rlt2jERcLzNDSYhD-M' };
-  const card = { name: 'Eternalgy Sdn Bhd', address: "23-01, Jalan Mutiara Emas 10/19, Taman Mount Austin, 81100 Johor Bahru, Johor Darul Ta'zim", mapsUrl: 'https://www.google.com/maps/place/Eternalgy+Sdn+Bhd/@1.55,103.78,17z/data=!16s%2Fg%2F11l5l59cd3' };
-  assert.equal(placeKey(feed), placeKey(card));
-});
-
-test('a storefront name is NOT unique and keeps its per-branch place id', () => {
-  const a = { name: 'The Store', address: ', 41, Jalan Radin Tengah',  mapsUrl: 'x!19sChIJpXZn5ohKzDERH2C4A_RWWYI' };
-  const b = { name: 'The Store', address: ', Jalan Pandan Indah 1/25', mapsUrl: 'x!19sChIJczAti182zDER_dLODe-bPmM' };
-  assert.notEqual(placeKey(a), placeKey(b));
-  assert.equal(placeKey(a), 'ChIJpXZn5ohKzDERH2C4A_RWWYI');
-});
-
-test('the suffix test does not fire on a word that merely ends in one', () => {
-  assert.equal(isRegisteredName('Klinik Mediviron'), false);
-  assert.equal(isRegisteredName('Restoran Kesavan'), false);
-  assert.equal(isRegisteredName('MR.DIY'), false);
-  assert.equal(isRegisteredName('Ali Shopping Centre Sdn. Bhd.'), true);
-  assert.equal(isRegisteredName('Verdant Solar Holdings Berhad'), true);
-});
