@@ -22,9 +22,8 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { saveScan, configured as dbConfigured } from './db.mjs';
 
-/** Keep the harvested rows on the worker if neither its database write nor the lab is available. */
+/** Keep the harvested rows on the worker if the hub cannot persist a job result. */
 export function saveRecoveryCopy(scanResult, payload, job) {
   const directory = process.env.WORKER_RECOVERY_DIR || path.join(os.homedir(), '.gmap-worker', 'unsaved-scans');
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -517,35 +516,18 @@ export async function scan(payload, job = null) {
       scrolls,
       tookMs: Date.now() - startedAt,
       at: new Date().toISOString(),
+      storage: 'hub',
     };
 
-    // The scan is the expensive part and it has already happened. A database
-    // that is down, or a token that expired overnight, must not turn a good
-    // scan into a failed job — the rows come back either way and the failure is
-    // reported in the result where it can be seen.
-    if (dbConfigured()) {
+    // The hub owns database writes through its DATABASE_URL. Keep a local copy
+    // before reporting so the harvested rows can be replayed if the hub is down.
+    if (payload?.reportPublicId) {
       try {
-        result.saved = await saveScan(result, {
-          jobId: job?.id ?? null,
-          worker: process.env.WORKER_NAME || os.hostname(),
-          userId: payload?.userId ?? null,
-        });
-      } catch (err) {
-        result.saved = null;
-        result.saveError = err.message;
-      }
-    } else {
-      result.saved = null;
-      result.saveError = 'Worker database persistence is not configured (PG_PROXY_URL, PG_DB_NAME, PG_PROXY_TOKEN)';
-    }
-    if (!result.saved?.reportId) {
-      try {
-        const recoveryFile = saveRecoveryCopy(result, payload, job);
+        saveRecoveryCopy(result, payload, job);
         result.recoverySnapshotStored = true;
-        console.error('[gmap.scan] database save failed: ' + result.saveError + '; recovery copy: ' + recoveryFile);
       } catch (err) {
         result.recoverySnapshotError = err.message;
-        console.error('[gmap.scan] database save failed: ' + result.saveError + '; could not write recovery copy: ' + err.message);
+        console.error('[gmap.scan] could not keep local recovery copy: ' + err.message);
       }
     }
 

@@ -13,7 +13,7 @@ const page = (over = {}) => ({
 });
 const list = (n) => Array.from({ length: n }, (_, i) => ({ name: 'biz ' + i }));
 
-test('an unsaved scan leaves a replayable worker recovery copy', () => {
+test('a hub-owned scan leaves a replayable worker recovery copy', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmap-recovery-test-'));
   const previous = process.env.WORKER_RECOVERY_DIR;
   process.env.WORKER_RECOVERY_DIR = directory;

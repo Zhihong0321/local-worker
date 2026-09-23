@@ -21,7 +21,7 @@ if (!response.ok) throw new Error('Hub health check failed (' + response.status 
 console.log('Hub database: ' + report.hub.database.status + (report.hub.database.error ? ' — ' + report.hub.database.error : ''));
 for (const lane of report.workers) {
   console.log(lane.worker + ': ' + lane.status
-    + (lane.result?.database ? ' (database: ' + lane.result.database + ')' : '')
+    + (lane.result?.recovery ? ' (recovery: ' + lane.result.recovery + ')' : '')
     + (lane.error ? ' — ' + lane.error : '')
     + (lane.jobId ? ' [job ' + lane.jobId + ']' : ''));
 }

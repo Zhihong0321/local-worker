@@ -359,12 +359,10 @@ async function run(name, job, session) {
       : job.payload;
     const result = await handler(payload, job);
     await report(name, job.id, true, result, null);
-    // A scan that ran fine but did not persist is the one failure that is
-    // invisible from here: the caller gets its rows and the job says done. The
-    // usual cause is the pg-proxy token having expired overnight, so it is
-    // named in the log rather than left inside the result JSON nobody reads.
-    if (job.type === 'gmap.scan' && !result?.saved?.reportId)
-      say('job ' + job.id + ' ran but did NOT save: ' + (result?.saveError || 'worker persistence returned no report id'));
+    // The hub writes the scan to its database. Report a failed local recovery
+    // copy because it is the backup if the hub cannot save the returned rows.
+    if (job.type === 'gmap.scan' && result?.recoverySnapshotError)
+      say('job ' + job.id + ' has no local recovery copy: ' + result.recoverySnapshotError);
     say('job ' + job.id + ' done in ' + (Date.now() - at) + 'ms');
   } catch (err) {
     // The handler failing must not take the loop down with it. Report and carry on.

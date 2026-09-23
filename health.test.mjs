@@ -1,22 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { health } from './health.mjs';
 
-test('a non-Maps lane confirms its process without requiring database credentials', async () => {
-  const result = await health({ database: false }, { configured: () => false });
-  assert.equal(result.database, 'not_required');
+test('a non-Maps lane confirms its process without local storage', async () => {
+  const result = await health({ recovery: false });
+  assert.equal(result.recovery, 'not_required');
 });
 
-test('a Maps lane fails if its database credentials are absent', async () => {
-  await assert.rejects(health({ database: true }, { configured: () => false }), /not configured/);
-});
-
-test('a Maps lane checks connectivity and every write grant', async () => {
-  const ok = { company_insert: true, company_update: true, report_insert: true, link_insert: true };
-  const result = await health({ database: true }, { configured: () => true, sql: async () => ({ rows: [ok] }) });
-  assert.equal(result.database, 'ok');
-  await assert.rejects(health({ database: true }, { configured: () => true,
-    sql: async () => ({ rows: [{ ...ok, link_insert: false }] }) }), /privilege/);
-  await assert.rejects(health({ database: true }, { configured: () => true,
-    sql: async () => { throw new Error('proxy token expired'); } }), /proxy token expired/);
+test('a Maps lane verifies its local recovery directory is writable', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-health-'));
+  const previous = process.env.WORKER_RECOVERY_DIR;
+  process.env.WORKER_RECOVERY_DIR = directory;
+  try {
+    const result = await health({ recovery: true });
+    assert.equal(result.recovery, 'ok');
+    assert.deepEqual(fs.readdirSync(directory), []);
+  } finally {
+    if (previous === undefined) delete process.env.WORKER_RECOVERY_DIR;
+    else process.env.WORKER_RECOVERY_DIR = previous;
+    fs.rmdirSync(directory);
+  }
 });
