@@ -158,5 +158,10 @@ export async function saveScan(result, { jobId = null, worker = null, userId = n
     );
   }
 
+  const verified = await sql('select count(*)::int as count from search_report_company where report_id = $1', [reportId]);
+  if (Number(verified.rows?.[0]?.count ?? 0) < rows.length) {
+    throw new Error('search report saved, but not all business links were persisted');
+  }
+
   return { reportId, companies: rows.length, linked: links.length };
 }

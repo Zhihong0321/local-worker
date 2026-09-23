@@ -122,6 +122,10 @@ Useful PM2 commands:
 
 ## 5. Verification
 
+After the hub and worker updates are deployed, run `npm run health`. The hub sends a targeted `worker.health` job to every registered online lane. A Maps lane checks its own pg-proxy connection and INSERT/UPDATE grants on the scan tables; other lanes prove they can accept and answer a job. The output also reports the hub's database probe. `pending` means a busy lane has not run its check yet; `unsupported` means that lane still runs an older worker version. Use the printed job ID with `GET /api/jobs/:id` to inspect a pending check later. This check does not test the Maps scrape or insert a company.
+
+If a scan cannot save, its result is kept in `~/.gmap-worker/unsaved-scans/` (or `WORKER_RECOVERY_DIR`). Once the hub's report repair endpoint and database access are healthy, run `node replay-scan.mjs PATH_TO_RECOVERY_JSON` to save the harvested companies into the original report without reopening Google Maps. Keep the JSON until the repaired report appears in the map.
+
 ### Test 1: Proof of Connection (Ping)
 When started, the console will print:
 ```text

@@ -24,6 +24,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { saveScan, configured as dbConfigured } from './db.mjs';
 
+/** Keep the harvested rows on the worker if neither its database write nor the lab is available. */
+export function saveRecoveryCopy(scanResult, payload, job) {
+  const directory = process.env.WORKER_RECOVERY_DIR || path.join(os.homedir(), '.gmap-worker', 'unsaved-scans');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const jobId = String(job?.id || Date.now()).replace(/[^A-Za-z0-9_-]/g, '_');
+  const file = path.join(directory, jobId + '.json');
+  fs.writeFileSync(file, JSON.stringify({
+    reportPublicId: payload?.reportPublicId || null,
+    jobId: job?.id || null,
+    userId: payload?.userId || null,
+    scan: scanResult,
+  }), { encoding: 'utf8', mode: 0o600 });
+  return file;
+}
+
 function findChrome() {
   if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
     return process.env.CHROME_PATH;
@@ -518,6 +533,19 @@ export async function scan(payload, job = null) {
       } catch (err) {
         result.saved = null;
         result.saveError = err.message;
+      }
+    } else {
+      result.saved = null;
+      result.saveError = 'Worker database persistence is not configured (PG_PROXY_URL, PG_DB_NAME, PG_PROXY_TOKEN)';
+    }
+    if (!result.saved?.reportId) {
+      try {
+        const recoveryFile = saveRecoveryCopy(result, payload, job);
+        result.recoverySnapshotStored = true;
+        console.error('[gmap.scan] database save failed: ' + result.saveError + '; recovery copy: ' + recoveryFile);
+      } catch (err) {
+        result.recoverySnapshotError = err.message;
+        console.error('[gmap.scan] database save failed: ' + result.saveError + '; could not write recovery copy: ' + err.message);
       }
     }
 

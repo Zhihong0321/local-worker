@@ -1,7 +1,10 @@
 // The scan's one rule, tested without needing Google to misbehave on cue.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classify } from './gmap.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { classify, saveRecoveryCopy } from './gmap.mjs';
 
 const page = (over = {}) => ({
   feedPresent: true,
@@ -9,6 +12,26 @@ const page = (over = {}) => ({
   ...over,
 });
 const list = (n) => Array.from({ length: n }, (_, i) => ({ name: 'biz ' + i }));
+
+test('an unsaved scan leaves a replayable worker recovery copy', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmap-recovery-test-'));
+  const previous = process.env.WORKER_RECOVERY_DIR;
+  process.env.WORKER_RECOVERY_DIR = directory;
+  let file;
+  try {
+    file = saveRecoveryCopy({ businesses: [{ name: 'Example Shop' }], saveError: 'proxy expired' }, { reportPublicId: 'abcdefghijklmnopqrst' }, { id: 'job/1' });
+    assert.equal(path.dirname(file), directory);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(saved.reportPublicId, 'abcdefghijklmnopqrst');
+    assert.equal(saved.jobId, 'job/1');
+    assert.equal(saved.scan.businesses[0].name, 'Example Shop');
+  } finally {
+    if (file && fs.existsSync(file)) fs.unlinkSync(file);
+    fs.rmdirSync(directory);
+    if (previous === undefined) delete process.env.WORKER_RECOVERY_DIR;
+    else process.env.WORKER_RECOVERY_DIR = previous;
+  }
+});
 
 test('an empty feed is blocked with a null count, never found: 0', () => {
   const r = classify(page(), [], 50);

@@ -33,6 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { scan as gmapScan } from './gmap.mjs';
+import { health as workerHealth } from './health.mjs';
 import * as chatgpt from './chatgpt-ego.mjs';
 import * as agy from './agy.mjs';
 import * as fb from './fb.mjs';
@@ -236,6 +237,7 @@ async function ping(payload) {
 
 const handlers = {
   ping,
+  'worker.health': workerHealth,
   'gmap.scan': gmapScan,
   // The wrappers this machine now runs alongside the cloud's. Different account
   // for ChatGPT, and the agy that is already signed in here — so these are a
@@ -361,7 +363,8 @@ async function run(name, job, session) {
     // invisible from here: the caller gets its rows and the job says done. The
     // usual cause is the pg-proxy token having expired overnight, so it is
     // named in the log rather than left inside the result JSON nobody reads.
-    if (result?.saveError) say('job ' + job.id + ' ran but did NOT save: ' + result.saveError);
+    if (job.type === 'gmap.scan' && !result?.saved?.reportId)
+      say('job ' + job.id + ' ran but did NOT save: ' + (result?.saveError || 'worker persistence returned no report id'));
     say('job ' + job.id + ' done in ' + (Date.now() - at) + 'ms');
   } catch (err) {
     // The handler failing must not take the loop down with it. Report and carry on.
@@ -425,13 +428,14 @@ function calculateCooldown(type) {
  */
 async function lane(name, types, session) {
   say('lane "' + name + '" -> ' + LAB + ' (' + types.join(', ') + ')' + (session ? ' as ' + session : ''));
+  const claimTypes = [...new Set([...types, 'worker.health'])];
   let backoff = 0;
   while (!stopping) {
     try {
-      const job = await claim(name, types);
+      const job = await claim(name, claimTypes);
       backoff = 0;
       if (job) {
-        const stop = beat(name, types);
+        const stop = beat(name, claimTypes);
         try {
           await run(name, job, session);
         } finally {
