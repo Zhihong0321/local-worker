@@ -75,7 +75,7 @@ notepad .env
 Set your configuration:
 ```ini
 LAB_URL=https://ee-auto.up.railway.app
-LAB_TOKEN=eternalgy2026eternalgy2026
+LAB_TOKEN=replace-with-your-worker-token
 
 # Give this Windows machine a unique name:
 WORKER_NAME=windows-pc-1
@@ -122,6 +122,29 @@ Useful PM2 commands:
 
 ## 5. Verification
 
+After the hub and worker updates are deployed, run `npm run health`. The hub probes its own `DATABASE_URL` and scan-table write grants, then sends a targeted `worker.health` job to every registered online lane. A Maps lane also verifies that its local recovery directory is writable. `pending` means a busy lane has not run its check yet; `unsupported` means that lane still runs an older worker version. Use the printed job ID with `GET /api/jobs/:id` to inspect a pending check later. This check does not run a Maps scrape or insert a company.
+
+The hub saves each scan through its `DATABASE_URL`; the worker does not need a database proxy token. For each report scan, the worker keeps a local copy in `~/.gmap-worker/unsaved-scans/` (or `WORKER_RECOVERY_DIR`). If hub persistence fails, run `node replay-scan.mjs PATH_TO_RECOVERY_JSON` after the hub recovers to save the harvested companies into the original report without reopening Google Maps. Keep the JSON until the report appears in the map, then remove old copies as part of routine disk maintenance.
+
+### Hub-triggered updates
+
+After this version is installed once on each machine, the hub can send a targeted `worker.update` job to one lane per worker process. The worker finishes active jobs, fetches the approved `local-worker` `main` branch, checks the pinned commit, fast-forwards a clean checkout, reports the result, then exits. The Windows launchers and PM2 restart it. A Mac launchd service must have `KeepAlive` enabled for the same handoff. The hub's response includes a job ID for each update, and `GET /api/jobs/:id` shows its result.
+
+Set a separate `WORKER_OTA_ADMIN_TOKEN` (at least 32 random characters) **only on the hub and the operator machine**. Do not put it in a worker `.env` file. To trigger every online update coordinator from an operator shell after merging a worker release to `main`:
+
+```sh
+curl -X POST https://ee-auto.up.railway.app/api/jobs/update-workers \
+  -H "Authorization: Bearer $LAB_TOKEN" \
+  -H "X-Worker-Update-Token: $WORKER_OTA_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{}'
+```
+
+In PowerShell, use `Invoke-RestMethod -Method Post -Uri https://ee-auto.up.railway.app/api/jobs/update-workers -Headers @{ Authorization = "Bearer $env:LAB_TOKEN"; 'X-Worker-Update-Token' = $env:WORKER_OTA_ADMIN_TOKEN } -ContentType 'application/json' -Body '{}'`.
+
+The hub pins one GitHub `main` commit for the whole run. It does not accept arbitrary commands, URLs, or branches. A worker refuses to overwrite tracked local edits or divergent history. Check `git status --short` on any machine reported as failed, review those edits, then rerun the hub update. Existing workers that do not yet advertise `worker.update` appear as unsupported and need one manual update and restart to gain OTA support. A worker started directly with `node worker.mjs`, without a restarting supervisor, will exit after updating and must be started again manually.
+
+For a Mac mini, clone this repository and copy `launchd/com.eternalgy.local-worker.plist.example` to `~/Library/LaunchAgents/com.eternalgy.local-worker.plist`. Replace the absolute Node, repository, env-file, and existing log-directory placeholders, then run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.eternalgy.local-worker.plist`. Check `launchctl print gui/$(id -u)/com.eternalgy.local-worker` and the configured logs. `RunAtLoad` and `KeepAlive` restart the worker after an OTA handoff. If running multiple worker processes, give each a distinct launchd label, worker name, and Git checkout so an update to one process cannot replace files used by another active process.
+
 ### Test 1: Proof of Connection (Ping)
 When started, the console will print:
 ```text
@@ -138,6 +161,6 @@ node gmap.mjs "cafe" "nilai" 5
 ### Test 3: Central Cloud Verification
 Check active workers registered on Railway:
 ```cmd
-curl -s -H "Authorization: Bearer eternalgy2026eternalgy2026" https://ee-auto.up.railway.app/api/jobs
+curl -s -H "Authorization: Bearer YOUR_LAB_TOKEN" https://ee-auto.up.railway.app/api/jobs
 ```
 You will see your Windows worker listed in the `workers` array with its last seen timestamp and public IP.

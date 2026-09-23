@@ -22,17 +22,18 @@
 // machine, one scan at a time, is what a residential line can do without
 // looking like something other than a person.
 //
-// It never exits on purpose. A worker that quits on a network blip is a worker
-// that is offline until someone notices, and the whole point of this machine is
-// that nobody is watching it.
+// Network blips keep the loop running. A successful OTA update exits deliberately
+// so a supervisor can restart the process on the new commit.
 //
 // Usage:
-//   LAB_TOKEN=… node worker/macmini.mjs
-// or put LAB_TOKEN in ~/.gmap-worker.env and just run it. See worker/README.md.
+//   LAB_TOKEN=… node worker.mjs
+// or put LAB_TOKEN in ~/.gmap-worker.env and just run it. See README.md.
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { scan as gmapScan } from './gmap.mjs';
+import { health as workerHealth } from './health.mjs';
+import { currentCommit, updateWorker } from './update.mjs';
 import * as chatgpt from './chatgpt-ego.mjs';
 import * as agy from './agy.mjs';
 import * as fb from './fb.mjs';
@@ -195,6 +196,36 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+const BOOT_COMMIT = await currentCommit();
+let updating = false;
+let restartRequested = false;
+let activeClaims = 0;
+let activeJobs = 0;
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function update(payload) {
+  if (!BOOT_COMMIT) throw new Error('worker update refused: current Git commit is unavailable');
+  updating = true;
+  try {
+    const result = await updateWorker(payload, {
+      bootCommit: BOOT_COMMIT,
+      waitForIdle: async () => {
+        const deadline = Date.now() + 20 * 60_000;
+        while (activeClaims > 0 || activeJobs > 1) {
+          if (Date.now() > deadline) throw new Error('worker update timed out waiting for other lanes to finish');
+          await pause(250);
+        }
+      },
+    });
+    if (!result.restartRequired) updating = false;
+    return result;
+  } catch (err) {
+    updating = false;
+    if (BOOT_COMMIT && await currentCommit() !== BOOT_COMMIT) restartRequested = true;
+    throw err;
+  }
+}
+
 const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 const say = (msg) => console.log('[' + stamp() + '] ' + msg);
 
@@ -236,6 +267,8 @@ async function ping(payload) {
 
 const handlers = {
   ping,
+  'worker.health': workerHealth,
+  'worker.update': update,
   'gmap.scan': gmapScan,
   // The wrappers this machine now runs alongside the cloud's. Different account
   // for ChatGPT, and the agy that is already signed in here — so these are a
@@ -285,6 +318,7 @@ const handlers = {
 async function claim(name, types) {
   const q = new URLSearchParams({ worker: name, wait: String(WAIT_SEC) });
   if (types.length) q.set('types', types.join(','));
+  if (BOOT_COMMIT) q.set('version', BOOT_COMMIT);
   // Above the server's own 25s ceiling: the server is expected to answer 204
   // first, so a timeout here means the network ate it, not that it was idle.
   const r = await fetch(LAB + '/api/jobs/next?' + q, {
@@ -330,7 +364,7 @@ function beat(name, types) {
     fetch(LAB + '/api/jobs/heartbeat', {
       method: 'POST',
       headers: jsonHeaders,
-      body: JSON.stringify({ worker: name, types }),
+      body: JSON.stringify({ worker: name, types, version: BOOT_COMMIT }),
       signal: AbortSignal.timeout(15_000),
     }).catch(() => {});
   }, BEAT_MS);
@@ -349,6 +383,7 @@ async function run(name, job, session) {
     return;
   }
   say('job ' + job.id + ' type=' + job.type + ' — running');
+  let shouldRestart = false;
   try {
     // The lane's session is a default, never an override: a payload that names an
     // `id` has chosen its account deliberately.
@@ -356,12 +391,12 @@ async function run(name, job, session) {
       ? { ...(job.payload ?? {}), id: job.payload?.id ?? session }
       : job.payload;
     const result = await handler(payload, job);
+    shouldRestart = job.type === 'worker.update' && result?.restartRequired === true;
     await report(name, job.id, true, result, null);
-    // A scan that ran fine but did not persist is the one failure that is
-    // invisible from here: the caller gets its rows and the job says done. The
-    // usual cause is the pg-proxy token having expired overnight, so it is
-    // named in the log rather than left inside the result JSON nobody reads.
-    if (result?.saveError) say('job ' + job.id + ' ran but did NOT save: ' + result.saveError);
+    // The hub writes the scan to its database. Report a failed local recovery
+    // copy because it is the backup if the hub cannot save the returned rows.
+    if (job.type === 'gmap.scan' && result?.recoverySnapshotError)
+      say('job ' + job.id + ' has no local recovery copy: ' + result.recoverySnapshotError);
     say('job ' + job.id + ' done in ' + (Date.now() - at) + 'ms');
   } catch (err) {
     // The handler failing must not take the loop down with it. Report and carry on.
@@ -380,6 +415,11 @@ async function run(name, job, session) {
     await report(name, job.id, false, null, detail + evidence).catch((e) =>
       say('could not even report the failure: ' + e.message),
     );
+  } finally {
+    if (shouldRestart) {
+      restartRequested = true;
+      say('updated checkout to main; draining complete, exiting for supervisor restart');
+    }
   }
 }
 
@@ -423,18 +463,25 @@ function calculateCooldown(type) {
  * The backoff is per lane. A lane whose engine is sick should not slow the one
  * beside it that is fine.
  */
-async function lane(name, types, session) {
+async function lane(name, types, session, updateCoordinator) {
   say('lane "' + name + '" -> ' + LAB + ' (' + types.join(', ') + ')' + (session ? ' as ' + session : ''));
+  const claimTypes = [...new Set([...types, 'worker.health', ...(updateCoordinator ? ['worker.update'] : [])])];
   let backoff = 0;
-  while (!stopping) {
+  while (!stopping && !restartRequested) {
+    if (updating) { await pause(250); continue; }
     try {
-      const job = await claim(name, types);
+      activeClaims += 1;
+      let job;
+      try { job = await claim(name, claimTypes); }
+      finally { activeClaims -= 1; }
       backoff = 0;
       if (job) {
-        const stop = beat(name, types);
+        const stop = beat(name, claimTypes);
+        activeJobs += 1;
         try {
           await run(name, job, session);
         } finally {
+          activeJobs -= 1;
           stop();
         }
         // Human cooldown jitter between jobs to avoid machine-burst detection.
@@ -459,4 +506,4 @@ async function lane(name, types, session) {
 say('worker "' + NAME + '" -> ' + LAB);
 // Promise.all rather than await in sequence: the lanes are the concurrency. If
 // one ever settles the process should end, which is what a rejection here does.
-await Promise.all(LANES.map((l) => lane(NAME + l.suffix, l.types, l.session)));
+await Promise.all(LANES.map((l, i) => lane(NAME + l.suffix, l.types, l.session, i === 0)));

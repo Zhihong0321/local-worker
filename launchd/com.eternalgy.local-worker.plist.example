@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.eternalgy.local-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ABSOLUTE_NODE_PATH__</string>
+    <string>__ABSOLUTE_REPO_PATH__/worker.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ABSOLUTE_REPO_PATH__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WORKER_ENV_FILE</key>
+    <string>__ABSOLUTE_ENV_PATH__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>__ABSOLUTE_LOG_PATH__/local-worker.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ABSOLUTE_LOG_PATH__/local-worker.err.log</string>
+</dict>
+</plist>
