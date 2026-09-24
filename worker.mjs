@@ -38,6 +38,12 @@ import * as agy from './agy.mjs';
 import * as fb from './fb.mjs';
 import * as x from './x.mjs';
 import * as ads from './ads.mjs';
+import * as gsearch from './gsearch.mjs';
+import * as research from './research-contact.mjs';
+import { createStatus } from './worker-status.mjs';
+import { createCloudStatus, startDashboard } from './worker-dashboard.mjs';
+import { createSetupStatus } from './worker-setup.mjs';
+import { quotaCooldownMs } from './quota.mjs';
 
 // Config from a local .env file or ~/.gmap-worker.env
 const localEnv = path.resolve('.env');
@@ -123,13 +129,23 @@ const LANES = (() => {
   if (pinned.length) {
     const chatgptOnly = pinned.filter((t) => t.startsWith('chatgpt.'));
     const agyOnly = pinned.filter((t) => t.startsWith('agy.'));
+    // Research work is split out even when pinned, and this is the one family
+    // where leaving it on the base lane would be actively wrong: the base lane is
+    // where a `gmap.scan` or a `ping` waits, a research run holds an agent for
+    // minutes, and it can end in a CAPTCHA that only a human can clear. Sharing a
+    // lane would let a stuck report block a job that answers in seconds.
+    const researchOnly = pinned.filter((t) => t.startsWith('research.'));
     // A single-purpose pin stays one lane. This is the scan daemon
     // (WORKER_TYPES=ping,gmap.scan): nothing to split, and one scan at a time is
     // the point of it.
-    if (sessions.length < 2 && !agyOnly.length) return [{ suffix: '', types: pinned, session: sessions[0] }];
-    // Whatever the pin asked for that is neither chatgpt nor agy still has to be
-    // claimed by somebody, or the pin silently stops serving it.
-    const rest = pinned.filter((t) => !chatgptOnly.includes(t) && !agyOnly.includes(t));
+    if (sessions.length < 2 && !agyOnly.length && !researchOnly.length) {
+      return [{ suffix: '', types: pinned, session: sessions[0] }];
+    }
+    // Whatever the pin asked for that is neither chatgpt, agy nor research still
+    // has to be claimed by somebody, or the pin silently stops serving it.
+    const rest = pinned.filter(
+      (t) => !chatgptOnly.includes(t) && !agyOnly.includes(t) && !researchOnly.includes(t),
+    );
     const accounts = sessions.length ? sessions : [undefined];
     const lanes = accounts.map((session, i) => ({
       suffix: i === 0 ? '' : '-' + (i + 1),
@@ -138,6 +154,9 @@ const LANES = (() => {
     }));
     for (let i = 0; agyOnly.length && i < AGY_LANES; i++) {
       lanes.push({ suffix: '-agy' + (i + 1), types: agyOnly, session: undefined });
+    }
+    if (researchOnly.length) {
+      lanes.push({ suffix: '-research', types: researchOnly, session: undefined });
     }
     return lanes.filter((l) => l.types.length);
   }
@@ -187,6 +206,17 @@ const LANES = (() => {
     // ads-recon serialises on runs/.lock anyway. A second lane would only produce
     // two jobs discovering they cannot both have the browser.
     { suffix: '-ads', types: ['ads.company', 'ads.market', 'ads.probe'] },
+    // Google search through the gsearch Chrome extension. Its own lane because
+    // gsearch.mjs paces queries seconds apart and may wait minutes on a CAPTCHA
+    // a human has to solve -- neither should hold up anyone else's work.
+    { suffix: '-gs', types: ['gsearch.search', 'gsearch.probe'] },
+    // Contact research via the research-contact Agent Skill. Its own lane for the
+    // reasons the fb.* and x.* lanes have theirs, plus one more: a full run drives
+    // an agent that may itself call the gsearch bridge AND the LinkedIn channel,
+    // so it is both minutes long and a consumer of two other lanes' resources. A
+    // run bouncing off a CAPTCHA or an expired login also stops for a human, which
+    // must never stall a lane that answers in seconds.
+    { suffix: '-research', types: ['research.contact', 'research.probe'] },
   ];
 })();
 
@@ -200,6 +230,24 @@ const say = (msg) => console.log('[' + stamp() + '] ' + msg);
 
 const auth = { authorization: 'Bearer ' + TOKEN };
 const jsonHeaders = { ...auth, 'content-type': 'application/json' };
+const status = createStatus({ name: NAME, lab: LAB, lanes: LANES, secrets: [TOKEN] });
+const quotaCooldowns = new Map();
+const groupFor = (name, types) => types.some((type) => type.startsWith('agy.')) ? NAME + ':agy' : name;
+function rememberQuota(group, until, reason = 'Individual quota reached') {
+  const parsed = Date.parse(String(until));
+  if (!Number.isFinite(parsed) || parsed <= Date.now()) return;
+  const deadline = Math.max(quotaCooldowns.get(group)?.until ?? 0, parsed);
+  quotaCooldowns.set(group, { until: deadline, reason });
+  for (const lane of LANES) {
+    const name = NAME + lane.suffix;
+    if (groupFor(name, lane.types) === group) status.laneCooldown(name, { until: deadline, reason });
+  }
+}
+const cloudStatus = createCloudStatus({ lab: LAB, token: TOKEN, workerName: NAME });
+// The setup checklist the dashboard's /setup page serves. Fast layer only when
+// polled; the deep layer (real MCP handshakes, a LinkedIn session probe) runs
+// strictly behind the page's explicit button, cached with a TTL.
+const setupStatus = createSetupStatus({ lanes: LANES, cloudStatus, gsearchStatus: () => gsearch.status() });
 
 // ------------------------------------------------------------------ handlers
 
@@ -278,13 +326,22 @@ const handlers = {
   // because 500 data URIs fit in neither a job result nor a Postgres row.
   'ads.market': ads.market,
   'ads.probe': ads.probe,
+  // Google search via the extension in this machine's own Chrome. See gsearch.mjs.
+  'gsearch.search': gsearch.search,
+  'gsearch.probe': gsearch.probe,
+  // Agent-backed public contact research. See research-contact.mjs; the handler
+  // owns payload validation and the JSON result contract, while the Skill owns
+  // the fetch/search/LinkedIn escalation policy.
+  'research.contact': research.contact,
+  'research.probe': research.probe,
 };
 
 // ---------------------------------------------------------------- the client
 
-async function claim(name, types) {
+async function claim(name, types, group) {
   const q = new URLSearchParams({ worker: name, wait: String(WAIT_SEC) });
   if (types.length) q.set('types', types.join(','));
+  q.set('cooldownGroup', group);
   // Above the server's own 25s ceiling: the server is expected to answer 204
   // first, so a timeout here means the network ate it, not that it was idle.
   const r = await fetch(LAB + '/api/jobs/next?' + q, {
@@ -294,19 +351,25 @@ async function claim(name, types) {
   // A bad token will never fix itself by retrying, and a loop that retries it
   // forever looks exactly like a worker that is running fine.
   if (r.status === 401) throw Object.assign(new Error('401 — LAB_TOKEN is wrong or was rotated'), { fatal: true });
-  if (r.status === 204) return null;
+  if (r.status === 204) {
+    const until = r.headers.get('x-worker-cooldown-until');
+    if (until) rememberQuota(group, until);
+    return null;
+  }
   if (!r.ok) throw new Error('/api/jobs/next answered ' + r.status + ': ' + (await r.text()).slice(0, 200));
   return (await r.json()).job ?? null;
 }
 
-async function report(name, id, ok, result, error) {
+async function report(name, id, ok, result, error, quotaMs = null) {
   const r = await fetch(LAB + '/api/jobs/' + id + '/result', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ worker: name, ok, result, error }),
+    body: JSON.stringify({ worker: name, ok, result, error,
+      ...(quotaMs ? { errorCode: 'quota_reached', retryAfterMs: quotaMs } : {}) }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!r.ok) throw new Error('posting the result answered ' + r.status + ': ' + (await r.text()).slice(0, 200));
+  return r.json();
 }
 
 /**
@@ -325,28 +388,70 @@ async function report(name, id, ok, result, error) {
  * 30s away and the window is 90s. A lab too old to know the route answers 404,
  * which is also nothing to say about — this file and the lab deploy separately.
  */
-function beat(name, types) {
+async function checkIn(name, types, group) {
+  status.heartbeat(name);
+  const quota = quotaCooldowns.get(group);
+  const r = await fetch(LAB + '/api/jobs/heartbeat', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ worker: name, types, cooldownGroup: group,
+      ...(quota?.until > Date.now() ? {
+        cooldownUntil: new Date(quota.until).toISOString(), cooldownReason: quota.reason,
+      } : {}) }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!r.ok) throw new Error('heartbeat answered ' + r.status);
+}
+
+function beat(name, types, group) {
   const timer = setInterval(() => {
-    fetch(LAB + '/api/jobs/heartbeat', {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: JSON.stringify({ worker: name, types }),
-      signal: AbortSignal.timeout(15_000),
-    }).catch(() => {});
+    checkIn(name, types, group).catch(() => {});
   }, BEAT_MS);
   timer.unref();
   return () => clearInterval(timer);
 }
 
-async function run(name, job, session) {
+/**
+ * Failure codes a handler throws to mean "the world is in a known state a human
+ * or a caller can act on", as opposed to "this code is broken".
+ *
+ * These travel to the gateway as `<code>: <message>` rather than as a stack,
+ * because the gateway has no structured channel — the string is the whole
+ * message, so the first token has to be the thing a reader routes on. The
+ * research.contact handler adds bad_request, not_installed and needs_human;
+ * the latter covers a Google CAPTCHA, a closed Chrome/gsearch extension and an
+ * expired LinkedIn session, which share a remedy ("a human, at this machine")
+ * and nothing else.
+ */
+const OPERATIONAL_CODES = new Set([
+  'logged_out',
+  'timeout',
+  'print_mode_timeout',
+  'bad_request',
+  'not_installed',
+  'needs_human',
+  'busy',
+  'gated',
+  'quota_reached',
+]);
+
+/**
+ * Run one job and say how it went.
+ *
+ * Returns `{ ok, durationMs, error }` so the lane can count the job without
+ * re-reading the log. `ok` means the handler returned AND the result reached
+ * the lab — a job whose result never posted is a job the caller never got.
+ */
+async function run(name, job, session, group) {
   const handler = handlers[job.type];
   const at = Date.now();
   if (!handler) {
     // Not a crash: an unknown type means this worker is older than whatever
     // queued the job. Saying so beats leaving it to expire as a silent timeout.
+    status.jobUnknown(name, job.type);
     say('job ' + job.id + ' type=' + job.type + ' — no handler on this worker');
     await report(name, job.id, false, null, 'no handler for type "' + job.type + '" on worker ' + name);
-    return;
+    return { ok: false, durationMs: Date.now() - at, error: 'no handler for type "' + job.type + '"' };
   }
   say('job ' + job.id + ' type=' + job.type + ' — running');
   try {
@@ -361,15 +466,22 @@ async function run(name, job, session) {
     // invisible from here: the caller gets its rows and the job says done. The
     // usual cause is the pg-proxy token having expired overnight, so it is
     // named in the log rather than left inside the result JSON nobody reads.
-    if (result?.saveError) say('job ' + job.id + ' ran but did NOT save: ' + result.saveError);
-    say('job ' + job.id + ' done in ' + (Date.now() - at) + 'ms');
+    if (result?.saveError) {
+      status.event('warn', name + ': job ' + job.id + ' ran but did NOT save — ' + result.saveError);
+      say('job ' + job.id + ' ran but did NOT save: ' + result.saveError);
+    }
+    const durationMs = Date.now() - at;
+    say('job ' + job.id + ' done in ' + durationMs + 'ms');
+    return { ok: true, durationMs, error: null };
   } catch (err) {
     // The handler failing must not take the loop down with it. Report and carry on.
     say('job ' + job.id + ' FAILED after ' + (Date.now() - at) + 'ms: ' + err.message);
     // A wrapper that is merely signed out must say so in a form the gateway can
     // read, not as a stack trace: it is the difference between "fix this login"
-    // and "this machine is broken".
-    const detail = err.code === 'logged_out' || err.code === 'timeout' || err.code === 'print_mode_timeout'
+    // and "this machine is broken". `engine_error` is deliberately not in
+    // OPERATIONAL_CODES — that one means the handler itself is broken, and its
+    // stack is the only useful thing anyone downstream will ever see.
+    const detail = OPERATIONAL_CODES.has(err.code)
       ? err.code + ': ' + err.message
       : (err.stack?.slice(0, 2000) ?? String(err));
     // `error` is a plain string all the way to the gateway -- there is no
@@ -377,20 +489,29 @@ async function run(name, job, session) {
     // exist downstream. err.meta carries the run directory the engine wrote its
     // transcript to; append it rather than lose it at the last hop.
     const evidence = err.meta ? ' | evidence: ' + JSON.stringify(err.meta).slice(0, 600) : '';
-    await report(name, job.id, false, null, detail + evidence).catch((e) =>
+    const failure = detail + evidence;
+    const quotaMs = err.code === 'quota_reached' ? err.retryAfterMs : quotaCooldownMs(failure);
+    if (Number.isFinite(quotaMs) && quotaMs > 0) {
+      const until = new Date(Date.now() + quotaMs).toISOString();
+      rememberQuota(group, until);
+      say('[' + name + '] quota reached — waiting until ' + until);
+    }
+    const response = await report(name, job.id, false, null, failure, quotaMs).catch((e) =>
       say('could not even report the failure: ' + e.message),
     );
+    if (response?.cooldownUntil) rememberQuota(group, response.cooldownUntil);
+    return { ok: false, durationMs: Date.now() - at, error: failure };
   }
 }
 
 let stopping = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
+    if (stopping) return;
     stopping = true;
-    say('stopping on ' + sig);
-    // A job in flight keeps its lease; the broker hands it to the next worker
-    // once that lease expires, so exiting here loses time, never the job.
-    process.exit(0);
+    say('stopping on ' + sig + ' after active jobs finish');
+    // Do not exit while a handler owns a Pi child. Each lane finishes and
+    // reports its current job, then the claim loop observes `stopping`.
   });
 }
 
@@ -425,31 +546,74 @@ function calculateCooldown(type) {
  */
 async function lane(name, types, session) {
   say('lane "' + name + '" -> ' + LAB + ' (' + types.join(', ') + ')' + (session ? ' as ' + session : ''));
+  const group = groupFor(name, types);
   let backoff = 0;
+  let currentJob = null;
+  let currentStartedAt = 0;
   while (!stopping) {
     try {
-      const job = await claim(name, types);
+      const quota = quotaCooldowns.get(group);
+      if (quota?.until > Date.now()) {
+        status.laneCooldown(name, { until: quota.until, reason: quota.reason });
+        await checkIn(name, types, group).catch((err) =>
+          say('[' + name + '] quota check-in failed: ' + err.message));
+        await new Promise((r) => setTimeout(r, Math.min(BEAT_MS, quota.until - Date.now())));
+        continue;
+      }
+      if (quota) quotaCooldowns.delete(group);
+      status.lanePolling(name);
+      const job = await claim(name, types, group);
       backoff = 0;
-      if (job) {
-        const stop = beat(name, types);
-        try {
-          await run(name, job, session);
-        } finally {
-          stop();
+      if (!job) {
+        if (quotaCooldowns.get(group)?.until > Date.now()) status.laneCooldown(name, { until: quotaCooldowns.get(group).until });
+        else status.laneIdle(name);
+        continue;
+      }
+
+      currentJob = job;
+      currentStartedAt = Date.now();
+      status.jobStart(name, job);
+      const stop = beat(name, types, group);
+      try {
+        const outcome = await run(name, job, session, group);
+        status.jobDone(name, {
+          id: job.id,
+          type: job.type,
+          ok: outcome.ok,
+          durationMs: outcome.durationMs,
+          error: outcome.error,
+        });
+        if (quotaCooldowns.get(group)?.until > Date.now()) {
+          status.laneCooldown(name, { until: quotaCooldowns.get(group).until });
         }
-        // Human cooldown jitter between jobs to avoid machine-burst detection.
-        // A real user doesn't open temporary chats or send CLI queries 2ms after finishing one.
-        const cooldown = calculateCooldown(job.type);
-        if (cooldown > 0 && !stopping) {
-          await new Promise((r) => setTimeout(r, cooldown));
-        }
+      } finally {
+        stop();
+      }
+      currentJob = null;
+      // Human cooldown jitter between jobs to avoid machine-burst detection.
+      // A real user doesn't open temporary chats or send CLI queries 2ms after finishing one.
+      const cooldown = calculateCooldown(job.type);
+      if (cooldown > 0 && !stopping) {
+        await new Promise((r) => setTimeout(r, cooldown));
       }
     } catch (err) {
+      if (currentJob) {
+        status.jobDone(name, {
+          id: currentJob.id,
+          type: currentJob.type,
+          ok: false,
+          durationMs: Date.now() - currentStartedAt,
+          error: err.message,
+        });
+        currentJob = null;
+      }
       if (err.fatal) {
+        status.laneStopped(name, err.message);
         say('FATAL: ' + err.message);
         process.exit(1);
       }
       backoff = Math.min(backoff ? backoff * 2 : 5_000, 60_000);
+      status.laneBackoff(name, { error: err.message, retryMs: backoff });
       say('[' + name + '] poll failed (' + err.message + ') — retrying in ' + backoff / 1000 + 's');
       await new Promise((r) => setTimeout(r, backoff));
     }
@@ -457,6 +621,26 @@ async function lane(name, types, session) {
 }
 
 say('worker "' + NAME + '" -> ' + LAB);
+// The loopback listener the gsearch extension dials into, also serving
+// POST /search to local callers. In this process, not a second server.
+if (process.env.GSEARCH_DISABLE !== '1') gsearch.start();
+// The read-only dashboard. Loopback-only like the gsearch listener, and
+// deliberately non-fatal: a dashboard that cannot bind its port must never be
+// the reason a worker stops claiming jobs.
+if (process.env.WORKER_DASHBOARD_DISABLE !== '1') {
+  try {
+    const dashboard = await startDashboard({
+      getStatus: () => status.snapshot(),
+      cloudStatus,
+      gsearchStatus: () => gsearch.status(),
+      setupStatus,
+      log: (msg) => say('[dashboard] ' + msg),
+    });
+    say('dashboard on ' + dashboard.url + ' (loopback only)');
+  } catch (err) {
+    say('[dashboard] listener failed — ' + err.message + ' (dashboard disabled in this process)');
+  }
+}
 // Promise.all rather than await in sequence: the lanes are the concurrency. If
 // one ever settles the process should end, which is what a rejection here does.
 await Promise.all(LANES.map((l) => lane(NAME + l.suffix, l.types, l.session)));

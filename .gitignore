@@ -5,3 +5,14 @@ npm-debug.log*
 *.log
 .DS_Store
 Thumbs.db
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+/.zcode/
+
+# Vendored Scrapling source is portable; local installations and captures are not.
+/scrapling-deep/.venv/
+/scrapling-deep/**/node_modules/
+/scrapling-deep/scrapling/.scrapling_dependencies_installed
+/scrapling-deep/solarvest-research.json
+/scrapling-deep/sols-research.json

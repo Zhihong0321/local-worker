@@ -1,6 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 title Local Worker - ee-auto
+cd /d "%~dp0"
 
 echo ========================================================
 echo   Local Worker for ee-auto.up.railway.app (Windows)

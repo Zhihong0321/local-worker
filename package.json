@@ -8,7 +8,8 @@
     "start": "node worker.mjs",
     "scan": "node gmap.mjs",
     "agy": "node agy.mjs",
-    "test": "node gmap.test.mjs"
+    "test": "node gmap.test.mjs && node meta-ego.test.mjs && node quota.test.mjs && node worker-status.test.mjs && node worker-dashboard.test.mjs && node research-contact.test.mjs && node worker-setup.test.mjs",
+    "setup": "node setup.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

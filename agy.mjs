@@ -14,15 +14,21 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { quotaCooldownMs } from './quota.mjs';
 
 function findAgy() {
-  if (process.env.AGY_BIN && fs.existsSync(process.env.AGY_BIN)) {
-    return process.env.AGY_BIN;
+  // worker.mjs loads .env after its static imports have been evaluated, so
+  // resolve this at call time (inside run), not while this module is imported.
+  const configured = process.env.AGY_BIN?.trim();
+  if (configured && (fs.existsSync(configured) || !/[\\/]/.test(configured))) {
+    return configured;
   }
   if (process.platform === 'win32') {
     const candidates = [
       path.join(os.homedir(), '.local', 'bin', 'agy.cmd'),
       path.join(os.homedir(), '.local', 'bin', 'agy.exe'),
+      path.join(process.env['LOCALAPPDATA'] ?? '', 'agy', 'bin', 'agy.exe'),
+      path.join(os.homedir(), 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
       path.join(process.env['LOCALAPPDATA'] ?? '', 'Programs', 'antigravity', 'agy.cmd'),
       path.join(process.env['LOCALAPPDATA'] ?? '', 'Programs', 'antigravity', 'agy.exe'),
       path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'antigravity', 'agy.cmd'),
@@ -31,12 +37,25 @@ function findAgy() {
     for (const c of candidates) {
       if (fs.existsSync(c)) return c;
     }
-    return process.env.AGY_BIN ?? 'agy.cmd';
+    // Installs made with a package manager or a custom directory may only be
+    // discoverable through PATH. Check the Windows executable suffixes too.
+    const pathExts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+    for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+      if (!dir) continue;
+      for (const name of ['agy', 'agy.exe', 'agy.cmd', 'agy.bat']) {
+        const candidate = path.join(dir, name);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+      for (const ext of pathExts) {
+        const candidate = path.join(dir, `agy${ext.toLowerCase()}`);
+        if (fs.existsSync(candidate)) return candidate;
+      }
+    }
+    return configured ?? 'agy.cmd';
   }
-  return process.env.AGY_BIN ?? path.join(os.homedir(), '.local/bin/agy');
+  return configured ?? path.join(os.homedir(), '.local/bin/agy');
 }
 
-const BIN = findAgy();
 const DEFAULT_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS ?? 300_000);
 
 /** Everything agy prints that means "I am not signed in" rather than "here is your answer". */
@@ -65,6 +84,13 @@ export async function ask(payload = {}) {
   const { code, stdout, stderr, timedOut } = await run(args, timeoutMs);
   const ms = Date.now() - startedAt;
   const answer = stdout.trim();
+
+  const quotaMs = quotaCooldownMs(`${stderr}\n${answer}`);
+  if (quotaMs !== null) {
+    throw Object.assign(new Error(firstLine(`${stderr}\n${answer}`, 500)), {
+      code: 'quota_reached', retryAfterMs: quotaMs,
+    });
+  }
 
   if (timedOut) {
     throw Object.assign(new Error(`agy did not finish within ${Math.round(timeoutMs / 1000)}s`), { code: 'timeout' });
@@ -119,6 +145,7 @@ export async function probe(payload = {}) {
     const out = await ask({ prompt: 'Reply with exactly one word: ok', timeoutMs: Number(payload.timeoutMs) || 90_000 });
     return { status: 'ready', detail: `answered in ${out.ms}ms`, sample: out.answer.slice(0, 80), ms: Date.now() - startedAt };
   } catch (err) {
+    if (err.code === 'quota_reached') throw err;
     const status = err.code === 'logged_out' ? 'logged_out' : err.code === 'timeout' ? 'unknown' : 'unknown';
     return { status, detail: err.message, ms: Date.now() - startedAt };
   }
@@ -128,8 +155,16 @@ function run(args, timeoutMs) {
   return new Promise((resolve) => {
     // cwd is the home directory rather than wherever the worker was started:
     // agy reads project context from cwd, and a prompt answered against whatever
+    const BIN = findAgy();
     const isWin = process.platform === 'win32';
-    const child = spawn(BIN, args, { cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], shell: isWin });
+    // Only .cmd/.bat need cmd.exe; a real .exe spawns directly. With shell:true
+    // Node joins the args with bare spaces, so an unquoted prompt containing
+    // spaces ("Reply with exactly one word: ok") gets split and agy rejects the
+    // fragments as unexpected arguments — quote defensively when the shell is
+    // unavoidable.
+    const needsShell = isWin && /\.(cmd|bat)$/i.test(BIN);
+    const spawnArgs = needsShell ? args.map((a) => `"${String(a).replace(/"/g, '""')}"`) : args;
+    const child = spawn(BIN, spawnArgs, { cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], shell: needsShell });
     let stdout = '';
     let stderr = '';
     let timedOut = false;

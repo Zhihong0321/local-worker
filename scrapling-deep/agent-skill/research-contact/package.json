@@ -1,0 +1,29 @@
+{
+  "name": "research-contact-skill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Portable, target-agnostic B2B telemarketing contact & decision-maker research skill for pi. Bundles recon, annual-report PDF extraction, and a live LinkedIn channel.",
+  "type": "module",
+  "bin": {
+    "research-contact-install": "install.mjs"
+  },
+  "scripts": {
+    "install": "node install.mjs",
+    "status": "node scripts/linkedin.mjs status"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "INSTALL.md",
+    "install.mjs",
+    "scripts/"
+  ]
+}
