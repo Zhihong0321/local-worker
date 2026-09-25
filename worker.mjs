@@ -127,6 +127,11 @@ const LANES = (() => {
   // proves it can take it.
   const sessions = (process.env.WORKER_SESSIONS ?? '').split(',').map((t) => t.trim()).filter(Boolean);
   const AGY_LANES = Math.max(1, Number(process.env.AGY_LANES ?? 2));
+  // Pi contact research shares this machine's Chrome, gsearch bridge, and
+  // LinkedIn session, so more than three lanes just multiplies 429s and
+  // captchas. One lane remains the default; RESEARCH_LANES raises it.
+  const parsedResearchLanes = Number(process.env.RESEARCH_LANES ?? 1);
+  const RESEARCH_LANES = Math.min(3, Math.max(1, Number.isFinite(parsedResearchLanes) ? Math.floor(parsedResearchLanes) : 1));
   if (pinned.length) {
     const chatgptOnly = pinned.filter((t) => t.startsWith('chatgpt.'));
     const agyOnly = pinned.filter((t) => t.startsWith('agy.'));
@@ -156,8 +161,12 @@ const LANES = (() => {
     for (let i = 0; agyOnly.length && i < AGY_LANES; i++) {
       lanes.push({ suffix: '-agy' + (i + 1), types: agyOnly, session: undefined });
     }
-    if (researchOnly.length) {
-      lanes.push({ suffix: '-research', types: researchOnly, session: undefined });
+    for (let i = 0; researchOnly.length && i < RESEARCH_LANES; i++) {
+      lanes.push({
+        suffix: i === 0 ? '-research' : '-research' + (i + 1),
+        types: researchOnly,
+        session: undefined,
+      });
     }
     return lanes.filter((l) => l.types.length);
   }
@@ -217,7 +226,10 @@ const LANES = (() => {
     // so it is both minutes long and a consumer of two other lanes' resources. A
     // run bouncing off a CAPTCHA or an expired login also stops for a human, which
     // must never stall a lane that answers in seconds.
-    { suffix: '-research', types: ['research.contact', 'research.probe'] },
+    ...Array.from({ length: RESEARCH_LANES }, (_, i) => ({
+      suffix: i === 0 ? '-research' : '-research' + (i + 1),
+      types: ['research.contact', 'research.probe'],
+    })),
   ];
 })();
 
