@@ -221,7 +221,7 @@ You will see your Windows worker listed in the `workers` array with its last see
 
 ## 6. Research-Contact Job Contract
 
-`research.contact` runs the Agent Skill in `scrapling-deep/agent-skill/research-contact` non-interactively and returns that Skill's final report object. The adapter reads Pi's `agent_end` JSON event, then gives extension cleanup a separate five-second window. A completed answer is accepted even if MCP teardown leaves the Pi process open; a run with no completion event reaches the configured Pi deadline and reports a timeout with captured diagnostics.
+`research.contact` runs the Agent Skill in `scrapling-deep/agent-skill/research-contact` non-interactively and returns that Skill's final report object. Contact research has no duration deadline. The adapter reads Pi's `agent_end` JSON event, then gives extension cleanup a separate five-second window. A completed answer is accepted even if MCP teardown leaves the Pi process open. The worker saves each answer to a local outbox before posting it to the report service and retries delivery after outages or restarts.
 
 Queue payload (extra keys are ignored):
 
@@ -232,7 +232,7 @@ Queue payload (extra keys are ignored):
 | `extraUrls` | no | Up to 20 public HTTP(S) URLs to add to recon (team, leadership, contact pages) |
 | `location` / `city` / `country` | no | Locale hint for search queries |
 | `locale` / `language` | no | Search interface language, e.g. `en`, `ms` |
-| `timeoutMs` | no | Run timeout, 30s–30min; default 15min (`RESEARCH_CONTACT_TIMEOUT_MS`) |
+| `timeoutMs` | no | Ignored for contact research; retained in older queued jobs for compatibility. |
 
 Result on success: `{ cheat_sheet, decision_makers, phone_contacts, email_contacts }`, matching the Skill's existing output shape. Evidence URLs are expected inside each entry.
 

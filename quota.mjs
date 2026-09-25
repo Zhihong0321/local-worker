@@ -1,7 +1,7 @@
 // The AGY CLI reports its account limit as plain text with a relative reset.
 export function quotaCooldownMs(message) {
   const text = String(message ?? '');
-  if (!/individual quota reached/i.test(text)) return null;
+  if (!/individual quota reached|rate_limit_error|token plan usage|(?:^|\W)429(?:\W|$)/i.test(text)) return null;
   const reset = /resets?\s+in\s+([^\r\n.]+)/i.exec(text)?.[1] ?? '';
   let ms = 0;
   for (const part of reset.matchAll(/(\d+)\s*(d(?:ays?)?|h(?:ours?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?)/gi)) {

@@ -44,6 +44,7 @@ import { createStatus } from './worker-status.mjs';
 import { createCloudStatus, startDashboard } from './worker-dashboard.mjs';
 import { createSetupStatus } from './worker-setup.mjs';
 import { quotaCooldownMs } from './quota.mjs';
+import { createContactOutbox } from './contact-outbox.mjs';
 
 // Config from a local .env file or ~/.gmap-worker.env
 const localEnv = path.resolve('.env');
@@ -230,6 +231,22 @@ const say = (msg) => console.log('[' + stamp() + '] ' + msg);
 
 const auth = { authorization: 'Bearer ' + TOKEN };
 const jsonHeaders = { ...auth, 'content-type': 'application/json' };
+const contactOutbox = createContactOutbox({
+  log: say,
+  post: async (receipt) => {
+    const r = await fetch(LAB + '/api/jobs/' + receipt.jobId + '/result', {
+      method: 'POST', headers: jsonHeaders,
+      body: JSON.stringify({ worker: receipt.worker, reportId: receipt.reportId,
+        ok: receipt.ok, result: receipt.result, error: receipt.error,
+        ...(receipt.retryAfterMs ? { retryAfterMs: receipt.retryAfterMs } : {}) }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!r.ok) throw new Error('posting contact result answered ' + r.status + ': ' + (await r.text()).slice(0, 200));
+    const acknowledgement = await r.json();
+    if (acknowledgement.saved !== true) throw new Error('hub acknowledged the job without confirming the contact report was saved');
+    return acknowledgement;
+  },
+});
 const status = createStatus({ name: NAME, lab: LAB, lanes: LANES, secrets: [TOKEN] });
 const quotaCooldowns = new Map();
 const groupFor = (name, types) => types.some((type) => type.startsWith('agy.')) ? NAME + ':agy' : name;
@@ -341,6 +358,7 @@ const handlers = {
 async function claim(name, types, group) {
   const q = new URLSearchParams({ worker: name, wait: String(WAIT_SEC) });
   if (types.length) q.set('types', types.join(','));
+  if (types.includes('research.contact')) q.set('contactProtocol', 'durable-v1');
   q.set('cooldownGroup', group);
   // Above the server's own 25s ceiling: the server is expected to answer 204
   // first, so a timeout here means the network ate it, not that it was idle.
@@ -360,7 +378,8 @@ async function claim(name, types, group) {
   return (await r.json()).job ?? null;
 }
 
-async function report(name, id, ok, result, error, quotaMs = null) {
+async function report(name, id, ok, result, error, quotaMs = null, reportId = null, isContact = false) {
+  if (isContact) return contactOutbox.deliver({ jobId: id, reportId: reportId == null ? null : String(reportId), worker: name, ok, result, error, retryAfterMs: quotaMs });
   const r = await fetch(LAB + '/api/jobs/' + id + '/result', {
     method: 'POST',
     headers: jsonHeaders,
@@ -395,6 +414,7 @@ async function checkIn(name, types, group) {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify({ worker: name, types, cooldownGroup: group,
+      ...(types.includes('research.contact') ? { contactProtocol: 'durable-v1' } : {}),
       ...(quota?.until > Date.now() ? {
         cooldownUntil: new Date(quota.until).toISOString(), cooldownReason: quota.reason,
       } : {}) }),
@@ -461,7 +481,8 @@ async function run(name, job, session, group) {
       ? { ...(job.payload ?? {}), id: job.payload?.id ?? session }
       : job.payload;
     const result = await handler(payload, job);
-    await report(name, job.id, true, result, null);
+    const delivery = await report(name, job.id, true, result, null, null,
+      job.payload?.reportId, job.type === 'research.contact');
     // A scan that ran fine but did not persist is the one failure that is
     // invisible from here: the caller gets its rows and the job says done. The
     // usual cause is the pg-proxy token having expired overnight, so it is
@@ -471,7 +492,7 @@ async function run(name, job, session, group) {
       say('job ' + job.id + ' ran but did NOT save: ' + result.saveError);
     }
     const durationMs = Date.now() - at;
-    say('job ' + job.id + ' done in ' + durationMs + 'ms');
+    say('job ' + job.id + (delivery?.queued ? ' answer saved locally; report delivery pending' : ' done') + ' in ' + durationMs + 'ms');
     return { ok: true, durationMs, error: null };
   } catch (err) {
     // The handler failing must not take the loop down with it. Report and carry on.
@@ -496,7 +517,8 @@ async function run(name, job, session, group) {
       rememberQuota(group, until);
       say('[' + name + '] quota reached — waiting until ' + until);
     }
-    const response = await report(name, job.id, false, null, failure, quotaMs).catch((e) =>
+    const response = await report(name, job.id, false, null, failure, quotaMs,
+      job.payload?.reportId, job.type === 'research.contact').catch((e) =>
       say('could not even report the failure: ' + e.message),
     );
     if (response?.cooldownUntil) rememberQuota(group, response.cooldownUntil);
@@ -624,6 +646,10 @@ say('worker "' + NAME + '" -> ' + LAB);
 // The loopback listener the gsearch extension dials into, also serving
 // POST /search to local callers. In this process, not a second server.
 if (process.env.GSEARCH_DISABLE !== '1') gsearch.start();
+void contactOutbox.replay().catch((error) => say('contact outbox replay failed: ' + error.message));
+setInterval(() => {
+  void contactOutbox.replay().catch((error) => say('contact outbox replay failed: ' + error.message));
+}, 30_000).unref();
 // The read-only dashboard. Loopback-only like the gsearch listener, and
 // deliberately non-fatal: a dashboard that cannot bind its port must never be
 // the reason a worker stops claiming jobs.

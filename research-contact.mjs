@@ -13,9 +13,6 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_SKILL_DIR = path.join(HERE, 'scrapling-deep', 'agent-skill', 'research-contact');
-const MAX_TIMEOUT_MS = 1_800_000;
-const DEFAULT_TIMEOUT_MS = 900_000;
-const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 32 * 1024;
 const EXIT_GRACE_MS = 5_000;
 const GSEARCH_PROBE_TIMEOUT_MS = 3_000;
@@ -112,21 +109,6 @@ function normaliseHttpUrl(value, label) {
   return parsed.href;
 }
 
-function timeoutFromPayload(value) {
-  if (value === undefined || value === null || value === '') return defaultTimeoutMs();
-  const number = Number(value);
-  if (!Number.isFinite(number) || number < 30_000 || number > MAX_TIMEOUT_MS) {
-    throw makeError(`timeoutMs must be between 30000 and ${MAX_TIMEOUT_MS}`, 'bad_request');
-  }
-  return Math.floor(number);
-}
-
-function defaultTimeoutMs() {
-  const value = Number(process.env.RESEARCH_CONTACT_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
-  if (!Number.isFinite(value) || value < 30_000) return DEFAULT_TIMEOUT_MS;
-  return Math.min(Math.floor(value), MAX_TIMEOUT_MS);
-}
-
 /** Normalize and validate the only payload fields accepted by the worker. */
 export function validatePayload(rawPayload) {
   const payload = rawPayload ?? {};
@@ -153,7 +135,6 @@ export function validatePayload(rawPayload) {
     extraUrls,
     location: firstField(payload, ['location', 'city', 'country'], 'location', 160),
     locale: firstField(payload, ['locale', 'language'], 'locale/language', 80),
-    timeoutMs: timeoutFromPayload(payload.timeoutMs),
   };
 }
 
@@ -341,9 +322,8 @@ export function validateResearchResult(value) {
   return value;
 }
 
-export function classifyFailure({ message = '', stderr = '', stdout = '', code = null, timedOut = false, spawnError = false, outputTooLarge = false } = {}) {
+export function classifyFailure({ message = '', stderr = '', stdout = '', code = null, timedOut = false, spawnError = false } = {}) {
   if (timedOut) return { code: 'timeout', message: `research-contact did not finish within the configured timeout` };
-  if (outputTooLarge) return { code: 'engine_error', message: 'research-contact output exceeded the 4 MiB limit' };
   const combined = `${message}\n${stderr}\n${stdout}`;
   if (spawnError || /ENOENT|not found|not recognized|cannot find|no such file|cli\.js bundle/i.test(combined)) {
     return { code: 'not_installed', message: `research-contact agent is unavailable: ${firstLine(combined) || 'Pi could not be started'}` };
@@ -397,7 +377,7 @@ export function runAgent(invocation, prompt, skillDir, timeoutMs, exitGraceMs = 
         shell: false,
       });
     } catch (error) {
-      resolve({ code: null, signal: null, stdout: '', stderr: '', timedOut: false, spawnError: error.message, outputTooLarge: false });
+      resolve({ code: null, signal: null, stdout: '', stderr: '', timedOut: false, spawnError: error.message });
       return;
     }
 
@@ -406,7 +386,6 @@ export function runAgent(invocation, prompt, skillDir, timeoutMs, exitGraceMs = 
     let response = '';
     let outputTail = '';
     let timedOut = false;
-    let outputTooLarge = false;
     let spawnError = '';
     let completed = false;
     let finalError = false;
@@ -419,14 +398,14 @@ export function runAgent(invocation, prompt, skillDir, timeoutMs, exitGraceMs = 
       clearTimeout(timer);
       clearTimeout(exitTimer);
       resolve({ code, signal, stdout: completed ? response : outputTail, stderr,
-        timedOut, spawnError, outputTooLarge, completed, finalError, cleanupTimedOut });
+        timedOut, spawnError, completed, finalError, cleanupTimedOut });
     }
-    const timer = setTimeout(() => {
+    const timer = timeoutMs > 0 ? setTimeout(() => {
       if (completed) return;
       timedOut = true;
       terminateChild(child);
       exitTimer = setTimeout(() => finish(null, null, true), exitGraceMs);
-    }, timeoutMs);
+    }, timeoutMs) : null;
 
     function readEvent(line) {
       let event;
@@ -461,13 +440,6 @@ export function runAgent(invocation, prompt, skillDir, timeoutMs, exitGraceMs = 
         pending = pending.slice(newline + 1);
         readEvent(line);
       }
-      if (Buffer.byteLength(pending) > MAX_OUTPUT_BYTES) {
-        outputTooLarge = true;
-        clearTimeout(timer);
-        terminateChild(child);
-        exitTimer = setTimeout(() => finish(null, null, true), exitGraceMs);
-        return;
-      }
     });
     child.stderr?.on('data', (chunk) => {
       if (Buffer.byteLength(stderr) < MAX_STDERR_BYTES) stderr += chunk.toString('utf8').slice(0, MAX_STDERR_BYTES - Buffer.byteLength(stderr));
@@ -490,11 +462,13 @@ export async function contact(payload, job) {
   const invocation = resolveAgentInvocation();
   if (!invocation.available) throw makeError(invocation.reason, 'not_installed');
 
-  const run = await runAgent(invocation, buildResearchPrompt(target, skillDir), skillDir, target.timeoutMs);
+  // A contact report has a permanent DB slot. Queue age and research duration
+  // do not invalidate it; only the agent's final answer or explicit failure does.
+  const run = await runAgent(invocation, buildResearchPrompt(target, skillDir), skillDir, 0);
   if (run.cleanupTimedOut && run.completed) {
     console.warn(`research-contact: Pi answered but did not exit within ${EXIT_GRACE_MS}ms; terminated process tree for job ${job?.id ?? 'local'}`);
   }
-  if (run.timedOut || run.outputTooLarge || run.spawnError || !run.completed || run.finalError) {
+  if (run.timedOut || run.spawnError || !run.completed || run.finalError) {
     const failure = classifyFailure({ ...run, message: run.spawnError });
     throw makeError(failure.message, failure.code, { jobId: job?.id ?? null, exitCode: run.code, signal: run.signal, stderr: run.stderr.slice(-2000), stdout: run.stdout.slice(-2000) });
   }

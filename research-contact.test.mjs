@@ -31,7 +31,6 @@ test('validatePayload accepts a company target and normalises URLs', () => {
     extraUrls: ['https://example.com/team'],
     location: 'Kuala Lumpur',
     locale: 'en-MY',
-    timeoutMs: 900_000,
   });
 });
 
@@ -46,7 +45,6 @@ test('validatePayload rejects malformed, private, and oversized inputs', () => {
   assert.throws(() => validatePayload({}), (error) => error.code === 'bad_request');
   assert.throws(() => validatePayload({ name: 'Example', domain: 'ftp://example.com' }), (error) => error.code === 'bad_request');
   assert.throws(() => validatePayload({ name: 'Example', domain: 'http://127.0.0.1:8080' }), (error) => error.code === 'bad_request');
-  assert.throws(() => validatePayload({ name: 'Example', timeoutMs: 1_000 }), (error) => error.code === 'bad_request');
   assert.throws(() => validatePayload({ name: 'x'.repeat(201) }), (error) => error.code === 'bad_request');
   assert.throws(() => validatePayload({ name: 'Example', extraUrls: Array.from({ length: 21 }, () => 'example.com') }), (error) => error.code === 'bad_request');
 });
@@ -135,6 +133,24 @@ test('Pi deadline is recorded when no completion event arrives', async () => {
     assert.equal(run.completed, false);
     assert.equal(run.timedOut, true);
     assert.match(run.stderr, /mock progress/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+});
+
+test('contact mode waits for a late Pi answer without a research deadline', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'research-contact-no-deadline-'));
+  try {
+    const script = path.join(dir, 'mock.mjs');
+    writeFileSync(script, `
+setTimeout(() => {
+  const answer = { cheat_sheet: {}, decision_makers: [{ name: 'Late Person' }], phone_contacts: [], email_contacts: [] };
+  console.log(JSON.stringify({ type: 'agent_end', messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(answer) }] }] }));
+}, 200);
+`);
+    const run = await runAgent({ command: process.execPath, prefixArgs: [script] }, 'mock prompt', process.cwd(), 0);
+    assert.equal(run.completed, true);
+    assert.equal(run.timedOut, false);
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
